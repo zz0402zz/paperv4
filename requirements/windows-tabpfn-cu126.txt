@@ -1,0 +1,12 @@
+# Windows + NVIDIA RTX 4060 Ti: isolated TabPFN comparison environment.
+# Python 3.11 only. Keep pandas below 3 because tabpfn-time-series==1.2.0 requires it.
+# CUDA 12.6 wheels are selected from the official PyTorch index.
+--index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://pypi.org/simple
+
+torch==2.13.0
+numpy>=2.1,<2.3
+pandas>=2.2,<3
+tabpfn==8.1.0
+tabpfn-time-series==1.2.0
+xlrd>=2.0.2
