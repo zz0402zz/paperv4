@@ -23,23 +23,24 @@ Delta-TabPFN执行17、42、73、101、202五个预设种子。
 
 ## 安装
 
-### Windows + RTX 4060 Ti（pip）
+### Windows + RTX 4060 Ti（uv）
 
 使用 **Python 3.11 x64**，并分别建立两个虚拟环境。不能合并：论文主线锁定
-`pandas 3.x`，而 `tabpfn-time-series==1.2.0` 要求 `pandas<3`。两个 requirements
-均锁定官方 PyTorch CUDA 12.6 wheel；4060 Ti 可用，不需要另装 CUDA Toolkit，但
-NVIDIA 驱动必须足够新。
+`pandas 3.x`，而 `tabpfn-time-series==1.2.0` 要求 `pandas<3`。TabPFN子项目已在
+Windows上将`torch`绑定到官方 CUDA 12.6 wheel；4060 Ti 可用，不需要另装 CUDA
+Toolkit，但 NVIDIA 驱动必须足够新。
 
 在 PowerShell、项目根目录运行：
 
 ```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements\windows-mainline-cu126.txt
+winget install --id=astral-sh.uv -e
+uv python install 3.11
 
-py -3.11 -m venv .venv-tabpfn
-.\.venv-tabpfn\Scripts\python.exe -m pip install --upgrade pip
-.\.venv-tabpfn\Scripts\python.exe -m pip install -r requirements\windows-tabpfn-cu126.txt
+$env:UV_PROJECT_ENVIRONMENT = "$PWD\.venv"
+uv sync --python 3.11 --index https://download.pytorch.org/whl/cu126
+
+$env:UV_PROJECT_ENVIRONMENT = "$PWD\.venv-tabpfn"
+uv sync --project scripts\tabpfn_comparison --locked --python 3.11
 ```
 
 安装后必须先确认 GPU 真正可见；`True`和显卡名才表示后续 TabPFN 会使用 CUDA：
