@@ -11,13 +11,6 @@ __pycache__/
 /tmp/
 /literature/
 /data/
-/tests/
-!/tests/
-/tests/*
-!/tests/tabpfn_comparison/
-/tests/tabpfn_comparison/*
-!/tests/tabpfn_comparison/__init__.py
-!/tests/tabpfn_comparison/test_data.py
 /outputs/
 /docs/
 .pytest_cache/

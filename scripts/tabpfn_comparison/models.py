@@ -8,13 +8,15 @@ import os
 
 import numpy as np
 
+from scripts.tabpfn_comparison import config
+
 
 PINNED_TABPFN_VERSION = "8.1.0"
 PINNED_TABPFN_TS_VERSION = "1.2.0"
 TS3_CHECKPOINT = "tabpfn-v3-regressor-v3_20260506_timeseries.ckpt"
 V2_CHECKPOINT_POLICY = (
-    "official ModelVersion.V2 resolved by tabpfn==8.1.0; the paper-reported "
-    "2noar4o2 checkpoint identity is not assumed without a matching file hash"
+    "official ModelVersion.V2 resolved through tabpfn==8.1.0's supported "
+    "factory; weights are loaded locally by the TabPFN package"
 )
 TS3_CHECKPOINT_POLICY = f"official local TS-3 checkpoint: {TS3_CHECKPOINT}"
 
@@ -60,7 +62,7 @@ def require_dependencies(*, need_time_series: bool) -> dict[str, str]:
 
 def model_identity(model: str) -> str | None:
     """Return an auditable identity statement without constructing a model."""
-    if model in {"tabpfn_ts_v2", "delta_tabpfn_v2"}:
+    if model in {"tabpfn_ts_v2", "delta_tabpfn_v2", "short_history_delta_tabpfn_v2"}:
         return V2_CHECKPOINT_POLICY
     if model == "tabpfn_ts3":
         return TS3_CHECKPOINT_POLICY
@@ -76,7 +78,8 @@ def make_v2_regressor(seed: int):
         ModelVersion.V2,
         device="auto",
         random_state=int(seed),
-        fit_mode="fit_with_cache",
+        fit_mode=config.TABPFN_FIT_MODE,
+        memory_saving_mode=config.TABPFN_MEMORY_SAVING_MODE,
         show_progress_bar=False,
     )
 

@@ -1,463 +1,229 @@
 #!/usr/bin/env python3
-"""Aggregate five-model 2024 results without rerunning the frozen GRU models."""
+"""Aggregate the causal single-station short-history comparison results."""
 
 from __future__ import annotations
 
 import argparse
-from importlib import metadata
-import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from scripts.common import forecasting, v2_experiment_protocol as protocol
-from scripts.tabpfn_comparison import (
-    config,
-    data as comparison_data,
-    io,
-    models as model_helpers,
-    run as runner,
-)
+from scripts.tabpfn_comparison import config, data, io, run
 
 
-def _flat_metrics(pred, true, mask) -> dict[str, object]:
+def _metrics(pred: np.ndarray, true: np.ndarray, mask: np.ndarray) -> dict[str, float | int | None]:
     valid = np.asarray(mask, dtype=bool) & np.isfinite(pred) & np.isfinite(true)
     if not valid.any():
         return {"valid_points": 0, "mae": None, "rmse": None, "nse": None}
     error = np.asarray(pred, dtype=float)[valid] - np.asarray(true, dtype=float)[valid]
     truth = np.asarray(true, dtype=float)[valid]
-    denominator = float(np.sum((truth - truth.mean()) ** 2))
+    denominator = float(np.square(truth - truth.mean()).sum())
     return {
         "valid_points": int(valid.sum()),
-        "mae": float(np.mean(np.abs(error))),
-        "rmse": float(np.sqrt(np.mean(np.square(error)))),
-        "nse": None
-        if denominator <= np.finfo(float).eps
-        else float(1.0 - np.sum(np.square(error)) / denominator),
+        "mae": float(np.abs(error).mean()),
+        "rmse": float(np.sqrt(np.square(error).mean())),
+        "nse": None if denominator <= np.finfo(float).eps else float(1.0 - np.square(error).sum() / denominator),
     }
 
 
-def tabpfn_cells(model: str, seed: int) -> pd.DataFrame:
-    rows = []
-    for target in config.TARGETS:
-        for station in config.STATIONS:
-            path = io.prediction_path(model, seed, target, station)
-            if not path.exists():
-                raise FileNotFoundError(
-                    f"Missing {path}. Run the requested TabPFN model first."
-                )
-            arrays, _ = io.load_prediction(path)
-            for horizon_index in range(config.OUTPUT_STEPS):
-                rows.append(
-                    {
-                        "variant": model,
-                        "station": station,
-                        "target": target,
-                        "horizon_step": horizon_index + 1,
-                        "horizon_hours": (horizon_index + 1) * config.STEP_HOURS,
-                        **_flat_metrics(
-                            arrays["pred"][:, horizon_index],
-                            arrays["true"][:, horizon_index],
-                            arrays["mask"][:, horizon_index],
-                        ),
-                        "seed": seed,
-                    }
-                )
-    return pd.DataFrame(rows)
-
-
-def mainline_cells() -> pd.DataFrame:
-    """Recompute both GRU and persistence metrics from audited origin files."""
-    frames = []
-    for seed in config.SEEDS:
-        frames.extend(
-            tabpfn_cells(model, seed)
-            for model in (config.DELTA_GRU_KEY, config.MATCHED_GRU_KEY)
-        )
-        rows = []
-        for target in config.TARGETS:
-            for station in config.STATIONS:
-                arrays, _ = io.load_prediction(
-                    io.prediction_path(
-                        config.DELTA_GRU_KEY,
-                        seed,
-                        target,
-                        station,
-                    )
-                )
-                persistence = np.repeat(
-                    arrays["current"], config.OUTPUT_STEPS, axis=1
-                )
-                for horizon_index in range(config.OUTPUT_STEPS):
-                    rows.append(
-                        {
-                            "variant": config.PERSISTENCE_KEY,
-                            "station": station,
-                            "target": target,
-                            "horizon_step": horizon_index + 1,
-                            "horizon_hours": (horizon_index + 1)
-                            * config.STEP_HOURS,
-                            **_flat_metrics(
-                                persistence[:, horizon_index],
-                                arrays["true"][:, horizon_index],
-                                arrays["mask"][:, horizon_index],
-                            ),
-                            "seed": seed,
-                        }
-                    )
-        frames.append(pd.DataFrame(rows))
-    return pd.concat(frames, ignore_index=True)
-
-
-def _expected_metadata(
+def _expected(
+    evaluation_split: str,
     model: str,
     seed: int,
     target: str,
     station: str,
-    features_by_target: dict[str, tuple[str, ...]],
-) -> dict:
-    if model in {config.DELTA_GRU_KEY, config.MATCHED_GRU_KEY}:
-        # Frozen checkpoints are loaded in the main paper environment. Preserve
-        # that audited torch version rather than substituting TabPFN-env torch.
-        manifest_path = config.MAINLINE_VALIDATION_DIR / "run_manifest.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        metadata_payload = runner.task_metadata(
-            model=model,
-            seed=seed,
-            target=target,
-            station=station,
-            features=features_by_target[target],
-        )
-        metadata_payload["torch_version"] = manifest["runtime_versions"]["torch"]
-        return metadata_payload
-    return runner.task_metadata(
+) -> dict[str, object]:
+    fit_splits = ("train",) if evaluation_split == "val" else ("train", "val")
+    return run.task_metadata(
+        evaluation_split=evaluation_split,
+        fit_splits=fit_splits,
         model=model,
         seed=seed,
         target=target,
         station=station,
-        features=features_by_target[target],
     )
 
 
-def completed_models(
-    features_by_target: dict[str, tuple[str, ...]],
-) -> tuple[str, ...]:
-    models = []
-    for model in config.TABPFN_KEYS:
-        if all(
-            io.is_complete(
-                io.prediction_path(model, seed, target, station),
-                _expected_metadata(
-                    model,
-                    seed,
-                    target,
-                    station,
-                    features_by_target,
-                ),
-            )
-            for seed in config.model_seeds(model)
-            for target in config.TARGETS
-            for station in config.STATIONS
-        ):
-            models.append(model)
-    return tuple(models)
-
-
-def require_frozen_gru_exports(
-    features_by_target: dict[str, tuple[str, ...]],
-) -> None:
-    missing = [
-        io.prediction_path(model, seed, target, station)
-        for model in (config.DELTA_GRU_KEY, config.MATCHED_GRU_KEY)
-        for seed in config.SEEDS
-        for target in config.TARGETS
-        for station in config.STATIONS
-        if (
-            not io.prediction_path(model, seed, target, station).exists()
-            or not io.is_complete(
-                io.prediction_path(model, seed, target, station),
-                _expected_metadata(
-                    model,
-                    seed,
-                    target,
-                    station,
-                    features_by_target,
-                ),
-            )
-        )
-    ]
-    if missing:
-        raise SystemExit(
-            "Frozen GRU prediction exports are incomplete. Run "
-            "`python -m scripts.tabpfn_comparison.run --model frozen_gru` "
-            "from the TabPFN environment first. "
-            f"First missing file: {missing[0]}"
-        )
-
-
-def attach_persistence(cells: pd.DataFrame) -> pd.DataFrame:
-    keys = ["seed", "station", "target", "horizon_hours"]
-    persistence = (
-        cells[cells["variant"].eq(config.PERSISTENCE_KEY)][keys + ["rmse"]]
-        .rename(columns={"rmse": "persistence_rmse"})
-        .drop_duplicates(keys)
-    )
-    output = cells.merge(persistence, on=keys, how="left", validate="many_to_one")
-    output["rmse_ratio_to_persistence"] = output["rmse"] / output["persistence_rmse"]
-    return output
-
-
-def summarize(cells: pd.DataFrame, models: tuple[str, ...]) -> dict[str, pd.DataFrame]:
-    output: dict[str, pd.DataFrame] = {}
-    for name, group in (
-        ("overall", None),
-        ("by_horizon", "horizon_hours"),
-        ("by_target", "target"),
-        ("by_station", "station"),
-    ):
-        groups = ["variant"] if group is None else [group, "variant"]
-        table = (
-            cells[cells["variant"].isin(models)]
-            .groupby(groups, as_index=False)["rmse_ratio_to_persistence"]
-            .mean()
-        )
-        if group is None:
-            table = table.set_index("variant")[["rmse_ratio_to_persistence"]].T
-            table.index = [0]
-        else:
-            table = table.pivot(
-                index=group,
-                columns="variant",
-                values="rmse_ratio_to_persistence",
-            ).reset_index()
-        for model in models:
-            if model == config.DELTA_GRU_KEY:
-                continue
-            table[f"{model}_vs_delta_gru_pct"] = (
-                table[model] / table[config.DELTA_GRU_KEY] - 1.0
-            ) * 100.0
-        output[name] = table
-    by_seed = (
-        cells[cells["variant"].isin(models)]
-        .groupby(["seed", "variant"], as_index=False)["rmse_ratio_to_persistence"]
-        .mean()
-        .pivot(index="seed", columns="variant", values="rmse_ratio_to_persistence")
-        .reset_index()
-    )
-    output["by_seed"] = by_seed
-    return output
-
-
-def weekly_bootstrap(
+def cells_for_model(
+    evaluation_split: str,
     model: str,
-    comparator: str,
-    *,
-    repeats: int = 2000,
-) -> dict[str, object]:
-    weekly_values: dict[str, list[float]] = {}
-    # A native zero-shot prediction is deterministic here.  Pair that one
-    # prediction with every frozen GRU seed and average within each week; this
-    # propagates comparator-seed variability without pretending the repeated
-    # native prediction is five independent model runs.
-    shared_seeds = config.SEEDS
-    for seed in shared_seeds:
-        model_seed = config.model_seed(model, seed)
-        for target in config.TARGETS:
-            for station in config.STATIONS:
-                arrays, _ = io.load_prediction(
-                    io.prediction_path(model, model_seed, target, station)
-                )
-                control, _ = io.load_prediction(
-                    io.prediction_path(comparator, seed, target, station)
-                )
-                for key in ("target_start", "true", "mask", "current"):
-                    if not np.array_equal(
-                        arrays[key], control[key], equal_nan=True
-                    ):
-                        raise RuntimeError(
-                            f"Models do not share identical {key}: "
-                            f"{model}, seed={seed}, {target}, {station}"
-                        )
-                weeks = pd.to_datetime(arrays["target_start"]).to_period("W").astype(str)
-                persistence = np.repeat(arrays["current"], config.OUTPUT_STEPS, axis=1)
-                for horizon_index in range(config.OUTPUT_STEPS):
-                    mask = (
-                        arrays["mask"][:, horizon_index].astype(bool)
-                        & control["mask"][:, horizon_index].astype(bool)
+    stations: tuple[str, ...],
+    targets: tuple[str, ...],
+    seeds: tuple[int, ...],
+) -> pd.DataFrame:
+    """Calculate one station-target-horizon metric row per saved prediction."""
+    rows: list[dict[str, object]] = []
+    for seed in config.model_seeds(model, seeds):
+        for station in stations:
+            for target in targets:
+                path = io.prediction_path(evaluation_split, model, seed, target, station)
+                expected = _expected(evaluation_split, model, seed, target, station)
+                if not io.is_complete(path, expected):
+                    raise FileNotFoundError(
+                        f"Missing or incompatible prediction: {path}. Run the same protocol first."
                     )
-                    truth = arrays["true"][:, horizon_index]
-                    persistence_error = persistence[:, horizon_index] - truth
-                    scale = (
-                        float(np.sqrt(np.mean(np.square(persistence_error[mask]))))
-                        if mask.any()
-                        else np.nan
+                arrays, _ = io.load_prediction(path)
+                for horizon in range(config.OUTPUT_STEPS):
+                    rows.append(
+                        {
+                            "variant": model,
+                            "seed": seed,
+                            "station": station,
+                            "target": target,
+                            "horizon_step": horizon + 1,
+                            "horizon_hours": (horizon + 1) * config.STEP_HOURS,
+                            **_metrics(
+                                arrays["pred"][:, horizon],
+                                arrays["true"][:, horizon],
+                                arrays["mask"][:, horizon],
+                            ),
+                        }
                     )
-                    if not np.isfinite(scale) or scale <= 0:
-                        continue
-                    difference = (
-                        np.square(arrays["pred"][:, horizon_index] - truth)
-                        - np.square(control["pred"][:, horizon_index] - truth)
-                    ) / np.square(scale)
-                    for week, value, valid in zip(weeks, difference, mask):
-                        if valid and np.isfinite(value):
-                            weekly_values.setdefault(str(week), []).append(float(value))
-    values = np.asarray(
-        [np.mean(items) for items in weekly_values.values()], dtype=float
-    )
-    if values.size < 2:
-        raise RuntimeError(
-            f"Insufficient natural-week blocks for bootstrap: {model} has "
-            f"{values.size}."
+    return pd.DataFrame(rows)
+
+
+def summarize(cells: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Use equal station-target-horizon weights, not raw observation counts."""
+    summaries: dict[str, pd.DataFrame] = {}
+    for name, groups in (
+        ("overall", ["variant"]),
+        ("by_station", ["station", "variant"]),
+        ("by_target", ["target", "variant"]),
+        ("by_horizon", ["horizon_hours", "variant"]),
+        ("by_seed", ["seed", "variant"]),
+    ):
+        summaries[name] = (
+            cells.groupby(groups, as_index=False)
+            .agg(
+                macro_rmse=("rmse", "mean"),
+                macro_mae=("mae", "mean"),
+                macro_nse=("nse", "mean"),
+                valid_points=("valid_points", "sum"),
+            )
+            .sort_values(groups)
+            .reset_index(drop=True)
         )
-    rng = np.random.default_rng(20260813)
-    draws = np.asarray(
-        [rng.choice(values, len(values), replace=True).mean() for _ in range(repeats)]
+    return summaries
+
+
+def tabpfn_vs_gru(cells: pd.DataFrame) -> pd.DataFrame:
+    """Pair only identical station, target, horizon, and random-seed cells."""
+    keys = ["seed", "station", "target", "horizon_step", "horizon_hours"]
+    left = cells.loc[cells["variant"].eq(config.DELTA_TABPFN_KEY), keys + ["rmse"]].rename(
+        columns={"rmse": "tabpfn_rmse"}
     )
-    return {
-        "comparison": f"{model} minus {comparator} normalized squared error",
-        "weekly_blocks": int(len(values)),
-        "point_estimate": float(values.mean()),
-        "ci95_low": float(np.quantile(draws, 0.025)),
-        "ci95_high": float(np.quantile(draws, 0.975)),
-    }
+    right = cells.loc[cells["variant"].eq(config.DELTA_GRU_KEY), keys + ["rmse"]].rename(
+        columns={"rmse": "gru_rmse"}
+    )
+    paired = left.merge(right, on=keys, how="inner", validate="one_to_one")
+    if paired.empty:
+        return pd.DataFrame(
+            columns=["scope", "cells", "tabpfn_macro_rmse", "gru_macro_rmse", "difference", "relative_pct", "tabpfn_win_rate"]
+        )
+    paired["difference"] = paired["tabpfn_rmse"] - paired["gru_rmse"]
+    paired["tabpfn_win"] = paired["difference"] < 0
+    rows: list[dict[str, object]] = []
+    for scope, frame in [("overall", paired), *[(f"target:{target}", group) for target, group in paired.groupby("target", sort=True)]]:
+        tabpfn_value = float(frame["tabpfn_rmse"].mean())
+        gru_value = float(frame["gru_rmse"].mean())
+        rows.append(
+            {
+                "scope": scope,
+                "cells": int(len(frame)),
+                "tabpfn_macro_rmse": tabpfn_value,
+                "gru_macro_rmse": gru_value,
+                "difference": float(frame["difference"].mean()),
+                "relative_pct": None if gru_value == 0 else (tabpfn_value / gru_value - 1.0) * 100.0,
+                "tabpfn_win_rate": float(frame["tabpfn_win"].mean()),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
-def save_report(
-    tables: dict[str, pd.DataFrame],
-    models: tuple[str, ...],
-    bootstrap: dict[str, dict[str, object]],
+def write_report(
+    output_dir: Path,
+    evaluation_split: str,
+    stations: tuple[str, ...],
+    targets: tuple[str, ...],
+    summaries: dict[str, pd.DataFrame],
+    paired: pd.DataFrame,
 ) -> None:
     lines = [
-        "# TabPFN 与变化量 GRU：2024 严格比较",
+        "# 单站短历史 TabPFN 与变化量 GRU 对比",
         "",
         "## 协议",
         "",
-        "- 固定7站、5指标、4小时时间粒度及4–72小时全部18个时距。",
-        "- Delta-GRU结果直接复用冻结主线，不重新训练。",
-        "- TabPFN-TS-v2对照和TabPFN-TS-3为逐站逐指标零样本滚动预测。",
-        "- v2对照由tabpfn==8.1.0的ModelVersion.V2解析；未把它冒充为已核验相同的论文2noar4o2权重。",
-        "- Delta-TabPFN-v2使用与匹配GRU相同的24小时原值、diff1、mask及当前值。",
-        "- 原生零样本模型固定seed=0；重复其相同预测不能冒充多种子实验。",
-        "- 主指标为站点×指标×时距等权RMSE/持久性RMSE，越低越好。",
-        "",
-        "## 已完成模型",
-        "",
-        *[f"- {model}" for model in models],
+        f"- 评估集：`{evaluation_split}`；拟合集：`{'train' if evaluation_split == 'val' else 'train + val'}`。",
+        f"- 每个站点和预测目标独立建模；站点数：{len(stations)}，目标数：{len(targets)}。",
+        f"- 输入：过去 {config.INPUT_STEPS} 个 {config.STEP_HOURS} 小时时间步（{config.INPUT_STEPS * config.STEP_HOURS} 小时）。",
+        f"- 输出：未来 {config.OUTPUT_STEPS} 个时间步；主时距为 {config.STEP_HOURS} 小时。",
+        "- 两个学习模型使用相同的本站原值、变化量、缺失掩码和当前目标值；没有跨站特征。",
+        "- TabPFN 和 GRU都预测变化量，随后加回当前目标值；持久性直接延用当前值。",
+        "- 正式标签仅使用 V2 质量侧表批准的原始观测；重建审阅值不进入输入或标签。",
+        "- 宏平均对站点 × 目标 × 时距单元等权；较低 RMSE 更好。",
     ]
     for title, key in (
         ("总体", "overall"),
-        ("分时距", "by_horizon"),
-        ("分指标", "by_target"),
         ("分站点", "by_station"),
-        ("分种子", "by_seed"),
+        ("分指标", "by_target"),
+        ("分时距", "by_horizon"),
+        ("分随机种子", "by_seed"),
     ):
-        lines.extend(
-            ["", f"## {title}", "", "```text", tables[key].to_string(index=False), "```"]
-        )
-    lines.extend(
-        ["", "## 按周聚类Bootstrap（相对原变化量Delta-GRU）", "", "```json", json.dumps(bootstrap, ensure_ascii=False, indent=2), "```", ""]
-    )
-    (config.OUTPUT_DIR / "report.md").write_text("\n".join(lines), encoding="utf-8")
+        lines.extend(["", f"## {title}", "", "```text", summaries[key].to_string(index=False), "```"])
+    lines.extend(["", "## TabPFN 相对 GRU", "", "```text", paired.to_string(index=False), "```"])
+    lines.append("")
+    (output_dir / "实验报告.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def save_manifest(models: tuple[str, ...]) -> None:
-    manifest = protocol.build_run_manifest(
-        experiment="tabpfn_2024_strict_comparison",
-        output_dir=config.OUTPUT_DIR,
-        seed=config.SEEDS[0],
-        code_paths=tuple(
-            Path(f"scripts/tabpfn_comparison/{name}")
-            for name in (
-                "config.py",
-                "data.py",
-                "io.py",
-                "models.py",
-                "run.py",
-                "report.py",
-            )
-        ),
-    )
-    package_versions = {}
-    for package in ("tabpfn", "tabpfn-time-series"):
-        try:
-            package_versions[package] = metadata.version(package)
-        except metadata.PackageNotFoundError:
-            package_versions[package] = None
-    manifest.update(
-        {
-            "models": list(models),
-            "stations": list(config.STATIONS),
-            "seeds": list(config.SEEDS),
-            "native_zero_shot_seed": 0,
-            "package_versions": package_versions,
-            "model_identities": {
-                model: model_helpers.model_identity(model)
-                for model in config.TABPFN_KEYS
-            },
-            "frozen_gru_result_dir": str(config.MAINLINE_VALIDATION_DIR),
-        }
-    )
-    forecasting.save_json(config.OUTPUT_DIR / "run_manifest.json", manifest)
+def _selection(args: argparse.Namespace) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    panel = data.load_v2_panel()
+    return run._selection(panel, args.stations, args.targets, args.all_stations, args.all_targets)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    station_group = parser.add_mutually_exclusive_group(required=True)
+    station_group.add_argument("--stations", help="Comma-separated V2 station names.")
+    station_group.add_argument("--all-stations", action="store_true")
+    target_group = parser.add_mutually_exclusive_group(required=True)
+    target_group.add_argument("--targets", help="Comma-separated official targets.")
+    target_group.add_argument("--all-targets", action="store_true")
+    parser.add_argument("--seeds", default=",".join(map(str, config.FORMAL_SEEDS)))
+    parser.add_argument("--evaluation-split", choices=("val", "test"), default="val")
+    return parser.parse_args()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--allow-partial", action="store_true")
-    args = parser.parse_args()
-    features_by_target = comparison_data.selected_features()
-    done = completed_models(features_by_target)
-    if args.allow_partial and not done:
-        raise SystemExit(
-            "No complete TabPFN model is available; partial report was not generated."
-        )
-    if not args.allow_partial and set(done) != set(config.TABPFN_KEYS):
-        missing = sorted(set(config.TABPFN_KEYS).difference(done))
-        raise SystemExit(f"TabPFN predictions incomplete: {missing}")
-    require_frozen_gru_exports(features_by_target)
-    frames = [mainline_cells()]
-    for model in done:
-        frames.extend(tabpfn_cells(model, seed) for seed in config.model_seeds(model))
-    cells = pd.concat(frames, ignore_index=True)
-    # Native zero-shot predictions are copied across the five reporting seeds only
-    # for equal-weight comparison with stochastic GRUs; uncertainty is not inferred
-    # from these duplicates, and the report explicitly labels seed=0.
-    native = cells[cells["variant"].isin(config.NATIVE_SPECS)].copy()
-    copies = []
-    for seed in config.SEEDS:
-        item = native.copy()
-        item["seed"] = seed
-        copies.append(item)
+    args = parse_args()
+    try:
+        stations, targets = _selection(args)
+        seeds = run._parse_seeds(args.seeds)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     cells = pd.concat(
-        [cells[~cells["variant"].isin(config.NATIVE_SPECS)], *copies],
+        [
+            cells_for_model(args.evaluation_split, model, stations, targets, seeds)
+            for model in config.MODEL_KEYS
+        ],
         ignore_index=True,
     )
-    cells = attach_persistence(cells)
-    models = (
-        config.DELTA_GRU_KEY,
-        config.MATCHED_GRU_KEY,
-        *done,
-    )
-    tables = summarize(cells, models)
-    config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    cells.to_csv(
-        config.OUTPUT_DIR / "station_target_horizon_metrics.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
-    for key, table in tables.items():
-        table.to_csv(
-            config.OUTPUT_DIR / f"comparison_{key}.csv",
-            index=False,
-            encoding="utf-8-sig",
-        )
-    bootstrap = {
-        model: weekly_bootstrap(model, config.DELTA_GRU_KEY)
-        for model in done
+    summaries = summarize(cells)
+    paired = tabpfn_vs_gru(cells)
+    output_dir = config.output_dir_for_split(args.evaluation_split)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cells.to_csv(output_dir / "站点指标时距明细.csv", index=False, encoding="utf-8-sig")
+    summary_filenames = {
+        "overall": "总体比较.csv",
+        "by_station": "分站点比较.csv",
+        "by_target": "分指标比较.csv",
+        "by_horizon": "分时距比较.csv",
+        "by_seed": "分随机种子比较.csv",
     }
-    forecasting.save_json(config.OUTPUT_DIR / "bootstrap_summary.json", bootstrap)
-    save_report(tables, models, bootstrap)
-    save_manifest(models)
+    for name, frame in summaries.items():
+        frame.to_csv(output_dir / summary_filenames[name], index=False, encoding="utf-8-sig")
+    paired.to_csv(output_dir / "TabPFN与GRU对比.csv", index=False, encoding="utf-8-sig")
+    write_report(output_dir, args.evaluation_split, stations, targets, summaries, paired)
 
 
 if __name__ == "__main__":

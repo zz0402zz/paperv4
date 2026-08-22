@@ -1,131 +1,125 @@
-# TabPFN 2024严格比较
+# 单站短历史 TabPFN 基线
 
-本目录实现以下五个模型在同一2024验证协议下的比较：
+本目录检验一个明确的问题：在每个站点独立、只看过去 24 小时（6 个 4 小时步长）时，
+TabPFN 预测水质**变化量**能否超过同输入的变化量 GRU。
 
-1. 原变化量Delta-GRU（载入现有冻结检查点）；
-2. 同输入近参数量Delta-GRU（载入现有冻结检查点）；
-3. 官方当前TabPFN-TS特征管线 + TabPFN-v2主干对照；
-4. 当前专用检查点TabPFN-TS-3；
-5. Delta-TabPFN-v2。
+该目录现作为论文的冻结基线，不在这里直接加入蒸馏逻辑。后续的时间前向 OOF 教师标签、
+混合损失和不确定性消融将放入独立的 `scripts/tabpfn_distillation/`，避免改变已有
+预测文件对应的代码身份。
 
-固定7站、5指标、2020–2023训练或上下文、2024验证、4小时数据、过去24小时
-输入和未来4–72小时全部18个时距。原生TabPFN-TS逐站逐指标滚动预测；每次预测
-只能看到该预测起点及以前的标签。Delta-TabPFN与匹配GRU使用相同的原值、
-`diff1`、有效性mask和当前值，但按站点、指标、时距分别执行TabPFN-v2回归。
+它使用项目的正式 V2 观测表和质量侧表，不使用图结构、其他站点特征、重建审阅值或未来
+信息。这里的“V2 数据”与 TabPFN 的 `ModelVersion.V2` 不是同一个概念。
 
-原生零样本模型固定`seed=0`。把同一结果复制五次不会形成五种子证据；只有
-Delta-TabPFN执行17、42、73、101、202五个预设种子。
+## 固定协议
 
-论文报告的v2检查点标识是`2noar4o2`，当前维护版`tabpfn==8.1.0`通过公开接口
-`ModelVersion.V2`解析v2权重。在没有文件哈希能够证明二者完全相同之前，本实验
-把第3个模型严格标成“官方当前v2主干对照”，不把它写成论文指定权重的完全复刻。
-这个限制只影响版本归因，不改变时间切分、输入可见性或评价方式。
+- 数据：`data/processed/v2/quantity_4h_observed.csv` 与质量侧表。
+- 时间：2022–2023 训练、2024 验证、2025-01-01 起测试。
+- 单位：每个“站点 × 预测指标”独立建模；本站以外的数据不会进入特征。
+- 输入：过去 6 步的 9 个水质原值、对应一阶变化量及显式有效性掩码，另加当前预测目标值。
+- 输出：未来 1 步（4 小时）的目标变化量；预测值由“当前值 + 预测变化量”还原。
+- 标签：仅使用质量侧表批准的原始观测。质量不通过的当前值或未来标签一律不参与拟合或评分。
+- 模型：持久性、固定容量的短历史 Delta-GRU、`tabpfn==8.1.0` 的 Delta-TabPFN-v2。
+
+TabPFN 使用内存节省模式，并将验证预测按 16 个起点分批送入 GPU，因此可以在 8 GB
+显存设备上运行；这只改变推理调度，不改变数据、模型或评价口径。
+
+GRU 不在验证集上早停或调参；两个学习模型的输入、目标、时间切分和缺失处理完全一致。
+验证集用于比较与方案选择，测试集必须在验证结论锁定后显式解锁。
 
 ## 安装
 
-### Windows + RTX 4060 Ti（uv）
+TabPFN 保留独立环境，以免改变主项目环境。请在项目根目录执行；Windows 路径请使用
+PowerShell 的相应写法：
 
-使用 **Python 3.11 x64**，并分别建立两个虚拟环境。不能合并：论文主线锁定
-`pandas 3.x`，而 `tabpfn-time-series==1.2.0` 要求 `pandas<3`。TabPFN子项目已在
-Windows上将`torch`绑定到官方 CUDA 12.6 wheel；4060 Ti 可用，不需要另装 CUDA
-Toolkit，但 NVIDIA 驱动必须足够新。
+```bash
+UV_PROJECT_ENVIRONMENT=.venv-tabpfn \
+uv sync --locked
+```
 
-在 PowerShell、项目根目录运行：
+Windows PowerShell 等价命令为：
 
 ```powershell
-winget install --id=astral-sh.uv -e
-uv python install 3.11
-
-$env:UV_PROJECT_ENVIRONMENT = "$PWD\.venv"
-uv sync --python 3.11 --index https://download.pytorch.org/whl/cu126
-
 $env:UV_PROJECT_ENVIRONMENT = "$PWD\.venv-tabpfn"
-uv sync --project scripts\tabpfn_comparison --locked --python 3.11
-```
-
-安装后必须先确认 GPU 真正可见；`True`和显卡名才表示后续 TabPFN 会使用 CUDA：
-
-```powershell
-.\.venv-tabpfn\Scripts\python.exe -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CUDA unavailable')"
-```
-
-如显示 `False`，先更新 NVIDIA 驱动，再删除两个 `.venv*` 环境后按上述命令重装；
-不要在 CPU 环境中开始原生 TabPFN-TS 滚动实验。
-
-PowerShell 中运行实验时：
-
-```powershell
+uv sync --locked
 $env:PYTHONPATH = "."
-.\.venv-tabpfn\Scripts\python.exe -m scripts.tabpfn_comparison.run --model frozen_gru
-.\.venv-tabpfn\Scripts\python.exe -m scripts.tabpfn_comparison.run --model tabpfn_ts_v2 --batch-size 8
-.\.venv-tabpfn\Scripts\python.exe -m scripts.tabpfn_comparison.run --model tabpfn_ts3 --batch-size 8
-.\.venv-tabpfn\Scripts\python.exe -m scripts.tabpfn_comparison.run --model delta_tabpfn_v2
-.\.venv-tabpfn\Scripts\python.exe -m scripts.tabpfn_comparison.report
 ```
 
-`--batch-size 8` 只把彼此独立的预测起点拼成批次，不放宽时间可见性；首次可先用
-`--batch-size 1` 运行一个已知可续跑的任务，再固定批量执行全量实验。
+首次创建 TabPFN 模型会下载本地权重并要求接受 Prior Labs 的许可证。模型输入仍在本地
+计算；代码关闭匿名遥测。
 
-### macOS（uv）
+## 先运行测试
 
 ```bash
-cd /Users/zz/Applications/paperv4
-UV_PROJECT_ENVIRONMENT=/Users/zz/Applications/paperv4/.venv-tabpfn \
-uv sync --project scripts/tabpfn_comparison --locked
+PYTHONPATH=. .venv-tabpfn/bin/python -m unittest discover -s tests/tabpfn_comparison -v
 ```
 
-TabPFN使用独立环境，是因为官方`tabpfn-time-series 1.2.0`依赖`pandas<3`，而
-现有论文主系统固定`pandas 3.x`。不要为安装TabPFN而降级或覆盖原`.venv`。
+Windows PowerShell 请把解释器替换为
+`.\.venv-tabpfn\Scripts\python.exe`，例如：
 
-本地模式不需要云API key。首次初始化模型会连接Prior Labs，要求登录并接受相应
-权重许可证；完成后权重缓存在本机。无图形登录时，可在
-`https://ux.priorlabs.ai`接受许可证并设置`TABPFN_TOKEN`。这不是云推理API key，
-模型输入仍在本地计算。实验代码显式关闭匿名遥测。
+```powershell
+.\.venv-tabpfn\Scripts\python.exe -m unittest discover -s tests\tabpfn_comparison -v
+```
 
-## 运行
+测试覆盖因果窗口、单站隔离、质量掩码、训练期缺失填充和预测文件元数据。
 
-先导出现有两个GRU的逐起点预测，不重新训练：
+## 验证集试运行
+
+先选择一个真实站点和一个目标。站点名称必须来自 V2 数据；以下用 `<站点名>` 和
+`<指标名>` 表示：
 
 ```bash
-PYTHONPATH=. .venv-tabpfn/bin/python -m scripts.tabpfn_comparison.run --model frozen_gru
+PYTHONPATH=. .venv-tabpfn/bin/python -m scripts.tabpfn_comparison.run \
+  --model all \
+  --stations "<站点名>" \
+  --targets "<指标名>" \
+  --seeds 42 \
+  --evaluation-split val
 ```
 
-该入口会自动调用现有论文主环境`.venv`加载冻结检查点，避免因为TabPFN隔离环境
-的依赖差异改变GRU推理；它只导出预测，不训练也不改写检查点。
-
-分别运行三个TabPFN实验：
+确认产物后，再执行全站点、全部五个目标和五个预设随机种子：
 
 ```bash
-PYTHONPATH=. .venv-tabpfn/bin/python -m scripts.tabpfn_comparison.run --model tabpfn_ts_v2
-PYTHONPATH=. .venv-tabpfn/bin/python -m scripts.tabpfn_comparison.run --model tabpfn_ts3
-PYTHONPATH=. .venv-tabpfn/bin/python -m scripts.tabpfn_comparison.run --model delta_tabpfn_v2
+PYTHONPATH=. .venv-tabpfn/bin/python -m scripts.tabpfn_comparison.run \
+  --model all \
+  --all-stations \
+  --all-targets \
+  --evaluation-split val
 ```
 
-原生滚动预测计算量很大。默认每批1个预测起点，这是最保守、最容易审计的严格
-模式。官方实现声明不同`item_id`独立；如果先用小规模一致性检查确认批量与逐起点
-结果相同，可显式增加，例如`--batch-size 8`，以换取速度。
+已有的预测只有元数据完全相同才会自动续跑；确实需要替换时才传入 `--force`。
 
-也可顺序执行全部步骤：
+## 汇总验证结果
+
+汇总命令必须使用与运行命令相同的站点、目标和种子范围：
 
 ```bash
-PYTHONPATH=. .venv-tabpfn/bin/python -m scripts.tabpfn_comparison.run --model all
+PYTHONPATH=. .venv-tabpfn/bin/python -m scripts.tabpfn_comparison.report \
+  --all-stations \
+  --all-targets \
+  --evaluation-split val
 ```
 
-原生滚动模型默认每32个预测批次（以及最终批次）原子保存`.partial.npz`，再次
-执行会逐项核对时间、真值、mask、当前值和协议元数据后续跑；可用
-`--checkpoint-every-batches`调整频率。其他模型按站点×指标保存。已有结果与冻结
-协议不一致时程序会停止，只有检查清楚且确实要覆盖时才使用`--force`。
+结果写入：
 
-全部预测完成后生成五模型报告：
+`outputs/单站短历史TabPFN对比/验证集/`
+
+其中 `TabPFN与GRU对比.csv` 是主比较表；负数 `difference` 和 `relative_pct` 表示
+TabPFN 的宏平均 RMSE 低于 GRU。`实验报告.md` 会列出数据、输入和汇总口径。
+逐样本文件统一放在一层 `预测结果/` 中，文件名直接标明模型、随机种子、站点和指标。
+
+## 测试集
+
+只在验证集结论和设置锁定后执行。测试会用训练集加验证集重新拟合，但不会读取任何测试
+标签作为训练信息：
 
 ```bash
-PYTHONPATH=. .venv-tabpfn/bin/python -m scripts.tabpfn_comparison.report
+PYTHONPATH=. .venv-tabpfn/bin/python -m scripts.tabpfn_comparison.run \
+  --model all \
+  --all-stations \
+  --all-targets \
+  --evaluation-split test \
+  --test-approved
 ```
 
-调试时可以查看已完成部分，但部分报告不能用于论文结论：
-
-```bash
-PYTHONPATH=. .venv-tabpfn/bin/python -m scripts.tabpfn_comparison.report --allow-partial
-```
-
-结果写入`outputs/paper/tabpfn_2024_comparison/`。
+随后将汇总命令的 `--evaluation-split` 改为 `test`。不要把长上下文的 TabPFN-TS 结果
+混入本实验的主结论；它回答的是不同的问题。

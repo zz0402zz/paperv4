@@ -1,176 +1,177 @@
-"""Shared, causal data construction for TabPFN variants."""
+"""Causal, single-station V2 windows for the short-history comparison."""
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from scripts.attention import training as mainline_training
+from scripts.common.wq_gru_data import load_processed_4h_data, target_ok_column
 from scripts.tabpfn_comparison import config
 
 
-def selected_features() -> dict[str, tuple[str, ...]]:
-    frame = pd.read_csv(config.FEATURE_SELECTION_PATH)
-    selected: dict[str, tuple[str, ...]] = {}
-    for target in config.TARGETS:
-        rows = frame[
-            frame["target"].eq(target) & frame["selected"].astype(bool)
-        ].copy()
-        rows["_self"] = rows["feature"].eq(target)
-        rows = rows.sort_values(
-            ["_self", "mean_horizon_score"],
-            ascending=[False, False],
-        )
-        selected[target] = tuple(rows["feature"].astype(str))
-    return selected
+def load_v2_panel() -> pd.DataFrame:
+    """Load only canonical V2 observations, never the review reconstruction."""
+    panel = load_processed_4h_data(config.OBSERVED_DATA_PATH)
+    panel = panel.loc[pd.to_datetime(panel["time"]) >= pd.Timestamp(config.START_DATE)].copy()
+    panel["station"] = panel["station"].astype(str)
+    panel["time"] = pd.to_datetime(panel["time"])
+    return panel.sort_values(["station", "time"]).reset_index(drop=True)
 
 
-def validation_splits(
-    panel: pd.DataFrame,
-    target: str,
-    features: tuple[str, ...],
-):
-    """Use the exact existing mainline window builder and split boundaries."""
-    return mainline_training.build_variant_splits(
-        panel,
-        config.STATIONS,
-        target,
-        features,
-        "state_change",
-        input_steps=config.INPUT_STEPS,
-        output_steps=config.OUTPUT_STEPS,
-    )
+def available_stations(panel: pd.DataFrame) -> tuple[str, ...]:
+    """Return the current V2 station inventory without hard-coding an old list."""
+    return tuple(sorted(panel["station"].dropna().astype(str).unique()))
 
 
-def station_arrays(split: dict[str, np.ndarray], station_index: int) -> dict:
-    """Extract one station while retaining the mainline forecast origins."""
+def _station_grid(
+    panel: pd.DataFrame, station: str, target: str
+) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
+    """Regularize one station while retaining missing observations as missing."""
+    if target not in config.TARGETS:
+        raise ValueError(f"Unsupported target: {target}")
+    station_frame = panel.loc[panel["station"].astype(str).eq(str(station))].copy()
+    if station_frame.empty:
+        raise ValueError(f"Unknown station: {station}")
+    station_frame = station_frame.sort_values("time").drop_duplicates("time", keep="last")
+    start = pd.Timestamp(station_frame["time"].min()).ceil(f"{config.STEP_HOURS}h")
+    end = pd.Timestamp(station_frame["time"].max()).floor(f"{config.STEP_HOURS}h")
+    times = pd.date_range(start, end, freq=f"{config.STEP_HOURS}h")
+    frame = station_frame.set_index("time").reindex(times)
+    values = frame.loc[:, config.INPUT_FEATURES].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    target_values = values[:, config.INPUT_FEATURES.index(target)]
+    quality_name = target_ok_column(target)
+    if quality_name in frame:
+        target_ok = frame[quality_name].fillna(False).to_numpy(bool)
+    else:
+        # A missing sidecar must not silently turn unapproved labels into valid
+        # labels. The canonical loader normally adds this column.
+        target_ok = np.zeros(len(frame), dtype=bool)
+    target_ok &= np.isfinite(target_values)
+    return times, values, target_ok
+
+
+def empty_dataset() -> dict[str, np.ndarray]:
+    """Return shape-stable empty arrays for a station without usable windows."""
+    feature_count = len(config.INPUT_FEATURES)
     return {
-        "true": np.asarray(split["y_abs"][:, :, station_index, 0], dtype=float),
-        "mask": np.asarray(split["y_mask"][:, :, station_index, 0], dtype=bool),
-        "current": np.asarray(
-            split["last_target"][:, station_index, :],
-            dtype=float,
-        ),
-        "target_start": np.asarray(split["target_start"], dtype="datetime64[ns]"),
+        "x_raw": np.empty((0, config.INPUT_STEPS, feature_count), dtype=float),
+        "x_diff": np.empty((0, config.INPUT_STEPS, feature_count), dtype=float),
+        "x_raw_mask": np.empty((0, config.INPUT_STEPS, feature_count), dtype=bool),
+        "x_diff_mask": np.empty((0, config.INPUT_STEPS, feature_count), dtype=bool),
+        "current": np.empty((0, 1), dtype=float),
+        "current_mask": np.empty((0, 1), dtype=bool),
+        "y_delta": np.empty((0, config.OUTPUT_STEPS), dtype=float),
+        "y_abs": np.empty((0, config.OUTPUT_STEPS), dtype=float),
+        "y_mask": np.empty((0, config.OUTPUT_STEPS), dtype=bool),
+        "target_start": np.asarray([], dtype="datetime64[ns]"),
+        "target_end": np.asarray([], dtype="datetime64[ns]"),
     }
 
 
-def approved_target_series(
-    panel: pd.DataFrame,
-    station: str,
-    target: str,
-) -> pd.DataFrame:
-    """Return causal target history; unapproved labels are absent, not imputed."""
-    target_ok = f"{target}__target_ok"
-    columns = ["time", target]
-    if target_ok in panel.columns:
-        columns.append(target_ok)
-    series = panel.loc[panel["station"].astype(str).eq(str(station)), columns].copy()
-    series["time"] = pd.to_datetime(series["time"])
-    series[target] = pd.to_numeric(series[target], errors="coerce")
-    valid = np.isfinite(series[target].to_numpy(float))
-    if target_ok in series:
-        valid &= series[target_ok].fillna(False).to_numpy(bool)
-    return (
-        series.loc[valid, ["time", target]]
-        .drop_duplicates("time", keep="last")
-        .sort_values("time")
-        .rename(columns={target: "target"})
-        .reset_index(drop=True)
-    )
+def build_station_target_dataset(
+    panel: pd.DataFrame, station: str, target: str
+) -> dict[str, np.ndarray]:
+    """Build causal local windows for one station and one prediction target.
+
+    Every row contains exactly ``INPUT_STEPS`` observations ending at the
+    current target value. Labels begin strictly at the next 4-hour timestamp.
+    The target quality sidecar controls both the current state and labels.
+    """
+    times, values, target_ok = _station_grid(panel, station, target)
+    total_steps = config.INPUT_STEPS + config.OUTPUT_STEPS
+    if len(times) < total_steps:
+        return empty_dataset()
+
+    diffs = np.full_like(values, np.nan, dtype=float)
+    diff_valid = np.zeros_like(values, dtype=bool)
+    if len(values) > 1:
+        candidate = values[1:] - values[:-1]
+        valid = np.isfinite(values[1:]) & np.isfinite(values[:-1])
+        diffs[1:] = np.where(valid, candidate, np.nan)
+        diff_valid[1:] = valid
+
+    target_index = config.INPUT_FEATURES.index(target)
+    rows: dict[str, list[object]] = {
+        "x_raw": [], "x_diff": [], "x_raw_mask": [], "x_diff_mask": [],
+        "current": [], "current_mask": [], "y_delta": [], "y_abs": [],
+        "y_mask": [], "target_start": [], "target_end": [],
+    }
+    for begin in range(len(times) - total_steps + 1):
+        current_index = begin + config.INPUT_STEPS - 1
+        future_slice = slice(current_index + 1, current_index + 1 + config.OUTPUT_STEPS)
+        current = values[current_index, target_index]
+        future = values[future_slice, target_index]
+        current_valid = bool(target_ok[current_index])
+        future_valid = target_ok[future_slice]
+        label_mask = current_valid & future_valid & np.isfinite(future)
+        delta = future - current
+
+        rows["x_raw"].append(values[begin : current_index + 1])
+        rows["x_diff"].append(diffs[begin : current_index + 1])
+        rows["x_raw_mask"].append(np.isfinite(values[begin : current_index + 1]))
+        rows["x_diff_mask"].append(diff_valid[begin : current_index + 1])
+        rows["current"].append([current])
+        rows["current_mask"].append([current_valid])
+        rows["y_delta"].append(delta)
+        rows["y_abs"].append(future)
+        rows["y_mask"].append(label_mask)
+        rows["target_start"].append(times[current_index + 1].to_datetime64())
+        rows["target_end"].append(times[current_index + config.OUTPUT_STEPS].to_datetime64())
+
+    return {
+        "x_raw": np.asarray(rows["x_raw"], dtype=float),
+        "x_diff": np.asarray(rows["x_diff"], dtype=float),
+        "x_raw_mask": np.asarray(rows["x_raw_mask"], dtype=bool),
+        "x_diff_mask": np.asarray(rows["x_diff_mask"], dtype=bool),
+        "current": np.asarray(rows["current"], dtype=float),
+        "current_mask": np.asarray(rows["current_mask"], dtype=bool),
+        "y_delta": np.asarray(rows["y_delta"], dtype=float),
+        "y_abs": np.asarray(rows["y_abs"], dtype=float),
+        "y_mask": np.asarray(rows["y_mask"], dtype=bool),
+        "target_start": np.asarray(rows["target_start"], dtype="datetime64[ns]"),
+        "target_end": np.asarray(rows["target_end"], dtype="datetime64[ns]"),
+    }
 
 
-def native_origin_batch(
-    series: pd.DataFrame,
-    origins: np.ndarray,
-    *,
-    max_context_length: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Batch independent contexts; TabPFN-TS processes item_ids independently."""
-    contexts = []
-    futures = []
-    for item_index, origin_value in enumerate(origins):
-        origin = pd.Timestamp(origin_value)
-        history = series.loc[series["time"].le(origin)].tail(max_context_length)
-        if len(history) < 2:
-            raise ValueError(f"Only {len(history)} valid values before {origin}.")
-        item_id = str(item_index)
-        # Restore the regular 4 h axis before handing data to the official
-        # pipeline. It then drops NaN targets exactly as documented, while the
-        # time-series frequency remains explicit and no value is imputed.
-        grid = pd.date_range(
-            history["time"].min(),
-            origin,
-            freq=f"{config.STEP_HOURS}h",
-        )
-        context = (
-            history.set_index("time")
-            .reindex(grid)
-            .rename_axis("timestamp")
-            .reset_index()
-        )
-        context["item_id"] = item_id
-        future = pd.DataFrame(
-            {
-                "item_id": item_id,
-                "timestamp": pd.date_range(
-                    origin + pd.Timedelta(hours=config.STEP_HOURS),
-                    periods=config.OUTPUT_STEPS,
-                    freq=f"{config.STEP_HOURS}h",
-                ),
-            }
-        )
-        contexts.append(context[["item_id", "timestamp", "target"]])
-        futures.append(future)
-    return pd.concat(contexts, ignore_index=True), pd.concat(futures, ignore_index=True)
+def split_by_time(dataset: dict[str, np.ndarray]) -> dict[str, dict[str, np.ndarray]]:
+    """Split by forecast times so no training label crosses a V2 boundary."""
+    target_start = pd.to_datetime(dataset["target_start"])
+    target_end = pd.to_datetime(dataset["target_end"])
+    masks = {
+        "train": target_end < pd.Timestamp(config.TRAIN_END),
+        "val": (target_start >= pd.Timestamp(config.TRAIN_END))
+        & (target_end < pd.Timestamp(config.VAL_END)),
+        "test": target_start >= pd.Timestamp(config.VAL_END),
+    }
+    return {
+        name: {key: value[np.asarray(mask)] for key, value in dataset.items()}
+        for name, mask in masks.items()
+    }
 
 
-def reshape_native_prediction(frame: pd.DataFrame, batch_size: int) -> np.ndarray:
-    work = frame.reset_index()
-    if "target" not in work:
-        raise ValueError("TabPFN-TS output does not contain target predictions.")
-    work["_item_order"] = pd.to_numeric(work["item_id"], errors="raise")
-    work = work.sort_values(["_item_order", "timestamp"])
-    values = pd.to_numeric(work["target"], errors="coerce").to_numpy(float)
-    expected = batch_size * config.OUTPUT_STEPS
-    if len(values) != expected:
-        raise ValueError(
-            f"Expected {expected} predictions, received {len(values)}."
-        )
-    return values.reshape(batch_size, config.OUTPUT_STEPS)
+def join_splits(*splits: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Concatenate fitting splits without changing their chronological arrays."""
+    if not splits:
+        return empty_dataset()
+    return {key: np.concatenate([split[key] for split in splits], axis=0) for key in splits[0]}
 
 
-def delta_tabular_xy(
-    raw_train: dict[str, np.ndarray],
-    raw_val: dict[str, np.ndarray],
-    station_index: int,
-    horizon_index: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Same local state+diff+mask/current information as the matched GRU."""
+def tabpfn_features(split: dict[str, np.ndarray]) -> np.ndarray:
+    """Flatten the same local values, deltas, masks, and current state as GRU."""
+    raw = np.asarray(split["x_raw"], dtype=float).reshape(len(split["x_raw"]), -1)
+    diffs = np.asarray(split["x_diff"], dtype=float).reshape(len(split["x_diff"]), -1)
+    raw_mask = np.asarray(split["x_raw_mask"], dtype=bool).reshape(len(raw), -1).astype(float)
+    diff_mask = np.asarray(split["x_diff_mask"], dtype=bool).reshape(len(raw), -1).astype(float)
+    current = np.asarray(split["current"], dtype=float)
+    current_mask = np.asarray(split["current_mask"], dtype=bool).astype(float)
+    return np.concatenate((raw, diffs, raw_mask, diff_mask, current, current_mask), axis=1)
 
-    def features(split: dict[str, np.ndarray]) -> np.ndarray:
-        values = np.asarray(split["self_x"][:, :, station_index, :], dtype=float)
-        valid = np.asarray(split["self_mask"][:, :, station_index, :], dtype=bool)
-        current = np.asarray(split["last_target"][:, station_index, :], dtype=float)
-        current_valid = np.isfinite(current)
-        return np.concatenate(
-            (
-                values.reshape(len(values), -1),
-                valid.reshape(len(values), -1).astype(float),
-                current,
-                current_valid.astype(float),
-            ),
-            axis=1,
-        )
 
-    train_x = features(raw_train)
-    val_x = features(raw_val)
-    train_y = np.asarray(
-        raw_train["y"][:, horizon_index, station_index, 0],
-        dtype=float,
-    )
-    train_ok = np.asarray(
-        raw_train["y_mask"][:, horizon_index, station_index, 0],
-        dtype=bool,
-    ) & np.isfinite(train_y)
-    return train_x[train_ok], train_y[train_ok], val_x, train_ok
+def target_arrays(split: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Return persisted prediction fields in a model-independent format."""
+    return {
+        "true": np.asarray(split["y_abs"], dtype=float),
+        "mask": np.asarray(split["y_mask"], dtype=bool),
+        "current": np.asarray(split["current"], dtype=float),
+        "target_start": np.asarray(split["target_start"], dtype="datetime64[ns]"),
+    }

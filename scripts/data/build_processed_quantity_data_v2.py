@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import xlrd
 
-from scripts.baselines.gat_gru_baseline import TARGET_FEATURE_COLUMNS
+from scripts.common.v2_experiment_protocol import TARGET_FEATURE_COLUMNS
 from scripts.data.wq_preprocessing_v2 import (
     FEATURE_COLUMNS,
     aggregate_causal_4h,
@@ -26,17 +26,17 @@ from scripts.data.wq_preprocessing_v2 import (
 )
 
 
-RAW_DATA_DIR = Path("data/quantity")
+RAW_DATA_DIR = Path("data/国控小时数据")
 OUTPUT_DIR = Path("data/processed/v2")
-QUALITY_OUTPUT_DIR = Path("outputs/quality/preprocessing_v2")
+QUALITY_OUTPUT_DIR = Path("outputs/数据质量")
 OBSERVED_DATA_PATH = OUTPUT_DIR / "quantity_4h_observed.csv"
 QUALITY_DATA_PATH = OUTPUT_DIR / "quantity_4h_quality.csv"
 RECONSTRUCTED_DATA_PATH = OUTPUT_DIR / "quantity_4h_reconstructed_review.csv"
 RECONSTRUCTION_FLAGS_PATH = OUTPUT_DIR / "quantity_4h_reconstruction_flags.csv"
 METADATA_PATH = OUTPUT_DIR / "preprocessing_metadata.json"
-QUALITY_SUMMARY_PATH = QUALITY_OUTPUT_DIR / "station_feature_quality_summary.csv"
-DUPLICATE_SUMMARY_PATH = QUALITY_OUTPUT_DIR / "duplicate_resolution_summary.csv"
-SPLIT_COVERAGE_PATH = QUALITY_OUTPUT_DIR / "split_target_coverage.csv"
+QUALITY_SUMMARY_PATH = QUALITY_OUTPUT_DIR / "各站点指标质量汇总.csv"
+DUPLICATE_SUMMARY_PATH = QUALITY_OUTPUT_DIR / "重复时间记录处理汇总.csv"
+SPLIT_COVERAGE_PATH = QUALITY_OUTPUT_DIR / "训练验证测试标签覆盖.csv"
 
 START_DATE = pd.Timestamp("2020-01-01")
 TRAIN_END = pd.Timestamp("2024-01-01")
